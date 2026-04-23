@@ -185,6 +185,97 @@ def list_scopes() -> dict[str, dict]:
     return out
 
 
+def find_trip_combinations(
+    origins: Optional[list[str]] = None,
+    dests: Optional[list[str]] = None,
+    outbound_start: Optional[str] = None,
+    outbound_end: Optional[str] = None,
+    return_start: Optional[str] = None,
+    return_end: Optional[str] = None,
+    max_total_brl: Optional[int] = None,
+    min_stay_days: Optional[int] = None,
+    max_stay_days: Optional[int] = None,
+    scopes: Optional[list[str]] = None,
+    limit: int = 15,
+) -> list[dict]:
+    """Combina pares ida+volta da mesma rota e retorna ordenados por preço total.
+
+    Uma combinação é um {outbound_date, inbound_date} da mesma rota onde
+    inbound_date > outbound_date. Usado pra perguntas tipo 'ir no Carnaval
+    e voltar depois do feriado'.
+    """
+    from datetime import date as _d
+    reload_if_stale()
+
+    orig_set = _iata_set(origins)
+    dest_set = _iata_set(dests)
+    scope_set = set(scopes) if scopes else set(_bases().keys())
+
+    combos: list[dict] = []
+    for scope in scope_set:
+        entry = _CACHE.get(scope)
+        if not entry:
+            continue
+        for rid, r in entry["routes"].items():
+            if orig_set and r["origin"].upper() not in orig_set:
+                continue
+            if dest_set and r["dest"].upper() not in dest_set:
+                continue
+            res = entry["results"].get(rid)
+            if not res:
+                continue
+            out_prices = res.get("outbound") or {}
+            ret_prices = res.get("inbound") or {}
+            if not out_prices or not ret_prices:
+                continue
+
+            for out_date, out_price in out_prices.items():
+                if outbound_start and out_date < outbound_start:
+                    continue
+                if outbound_end and out_date > outbound_end:
+                    continue
+                try:
+                    out_d = _d.fromisoformat(out_date)
+                except Exception:
+                    continue
+                for ret_date, ret_price in ret_prices.items():
+                    if return_start and ret_date < return_start:
+                        continue
+                    if return_end and ret_date > return_end:
+                        continue
+                    try:
+                        ret_d = _d.fromisoformat(ret_date)
+                    except Exception:
+                        continue
+                    if ret_d <= out_d:
+                        continue  # volta tem que ser depois da ida
+                    stay = (ret_d - out_d).days
+                    if min_stay_days is not None and stay < min_stay_days:
+                        continue
+                    if max_stay_days is not None and stay > max_stay_days:
+                        continue
+                    total = out_price + ret_price
+                    if max_total_brl is not None and total > max_total_brl:
+                        continue
+                    combos.append({
+                        "origin": r["origin"].upper(),
+                        "dest": r["dest"].upper(),
+                        "outbound_date": out_date,
+                        "outbound_price_brl": out_price,
+                        "inbound_date": ret_date,
+                        "inbound_price_brl": ret_price,
+                        "total_price_brl": total,
+                        "stay_days": stay,
+                        "airline": r.get("airline"),
+                        "cabin": r.get("cabin"),
+                        "scope": scope,
+                        "route_id": rid,
+                    })
+
+    combos.sort(key=lambda x: x["total_price_brl"])
+    return combos[:limit]
+
+
 def get_route_history(origin: str, dest: str, scope: Optional[str] = None) -> list[dict]:
     """Retorna rotas cadastradas que batem com origin→dest (ou dest→origin)."""
     reload_if_stale()

@@ -19,7 +19,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from anthropic import Anthropic
 
-from data_loader import search_flights, list_scopes, get_route_history, reload_if_stale
+from data_loader import (
+    search_flights, find_trip_combinations,
+    list_scopes, get_route_history, reload_if_stale,
+)
 from regions import (
     REGIONS, IATA_NAMES, HOLIDAYS, MONTHS_PT,
     region_to_iatas, holiday_date_range, month_date_range,
@@ -150,6 +153,53 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "find_trip_combinations",
+        "description": (
+            "Combina ida + volta da MESMA rota e retorna pacotes ordenados por preço total. "
+            "USE ESTA (não search_flights) quando o usuário pede uma viagem com retorno "
+            "(qualquer menção a feriado, fim de semana, período específico, 'ida e volta', "
+            "'quero passar X dias em Y'). Retorna {outbound_date, inbound_date, total_price_brl, stay_days}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origins": {"type": "array", "items": {"type": "string"},
+                    "description": "IATAs de origem"},
+                "dests": {"type": "array", "items": {"type": "string"},
+                    "description": "IATAs de destino"},
+                "outbound_start": {"type": "string", "description": "Início do range de ida (ISO YYYY-MM-DD)"},
+                "outbound_end": {"type": "string", "description": "Fim do range de ida (ISO)"},
+                "return_start": {"type": "string", "description": "Início do range de volta"},
+                "return_end": {"type": "string", "description": "Fim do range de volta"},
+                "min_stay_days": {"type": "integer",
+                    "description": "Mínimo de dias entre ida e volta"},
+                "max_stay_days": {"type": "integer",
+                    "description": "Máximo de dias entre ida e volta"},
+                "max_total_brl": {"type": "integer",
+                    "description": "Preço total máximo (ida + volta) em reais"},
+                "scopes": {"type": "array", "items": {"type": "string"},
+                    "description": "Subset de scopes. Omita pra buscar em todos."},
+                "limit": {"type": "integer", "description": "Máx resultados. Default 15."},
+            },
+        },
+    },
+    {
+        "name": "list_holidays",
+        "description": (
+            "Lista feriados brasileiros cadastrados com suas datas. Use quando o usuário "
+            "perguntar sobre 'algum feriado' sem especificar qual, ou pedir recomendação ampla."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer",
+                    "description": "Filtra por ano específico. Omita pra listar todos."},
+                "from_date": {"type": "string",
+                    "description": "Retorna apenas feriados a partir desta data (YYYY-MM-DD). Útil pra não sugerir feriados passados."},
+            },
+        },
+    },
+    {
         "name": "get_route_history",
         "description": (
             "Detalhes de uma rota específica (origin→dest). Retorna scopes onde a rota existe, "
@@ -177,6 +227,25 @@ def execute_tool(name: str, args: dict) -> dict:
                 r["origin_city"] = IATA_NAMES.get(r["origin"], r["origin"])
                 r["dest_city"] = IATA_NAMES.get(r["dest"], r["dest"])
             return {"count": len(results), "results": results}
+
+        if name == "find_trip_combinations":
+            combos = find_trip_combinations(**args)
+            for c in combos:
+                c["origin_city"] = IATA_NAMES.get(c["origin"], c["origin"])
+                c["dest_city"] = IATA_NAMES.get(c["dest"], c["dest"])
+            return {"count": len(combos), "combinations": combos}
+
+        if name == "list_holidays":
+            out = []
+            for h_name, years in HOLIDAYS.items():
+                for yr, (start, end) in years.items():
+                    if args.get("year") and yr != args["year"]:
+                        continue
+                    if args.get("from_date") and end < args["from_date"]:
+                        continue
+                    out.append({"name": h_name, "year": yr, "start": start, "end": end})
+            out.sort(key=lambda x: x["start"])
+            return {"holidays": out}
 
         if name == "region_to_iatas":
             iatas = region_to_iatas(args["region"])
@@ -229,22 +298,31 @@ SYSTEM_PROMPT = """Você é o assistente da **Turbinando Suas Milhas**, uma plat
 
 **Seu papel:**
 - Interpretar perguntas em linguagem natural (regiões, datas, orçamentos)
-- Chamar as tools apropriadas (region_to_iatas, holiday_date_range, search_flights)
-- Apresentar resultados de forma objetiva e útil
-- Quando fizer sentido, comparar LATAM vs Geral (ex: "mesma rota tá R$X na LATAM e R$Y na geral")
+- Chamar as tools apropriadas e apresentar resultados de forma objetiva
+
+**Regras pra escolher a tool certa:**
+1. Se o usuário pede **viagem com ida e volta** (menciona feriado, fim de semana, período, "passar X dias em Y", "voltar depois de tanto tempo"): **SEMPRE use `find_trip_combinations`** — ela retorna pares ida+volta da MESMA rota com preço total. NÃO use search_flights nesse caso.
+2. Se pede só trechos soltos ("mais barato em julho", "voos pra BCN"): use `search_flights`.
+3. Se perguntar sobre "algum feriado", "qualquer feriado desse ano": primeiro `list_holidays(year=X, from_date=hoje)`, depois pra cada feriado relevante chame `find_trip_combinations` com outbound perto do início e return perto do fim do feriado (ou com folga de 1-3 dias depois).
+4. Para regiões ("Nordeste", "Europa"): `region_to_iatas` primeiro, depois use o array retornado em `dests`.
+
+**Ao usar find_trip_combinations pra feriado:**
+- outbound_start/end: do primeiro dia do feriado OU 1 dia antes → até o primeiro dia
+- return_start/end: do último dia do feriado → até 2-3 dias depois
+- Exemplo Carnaval 2027 (6-10/fev): outbound_start=2027-02-05, outbound_end=2027-02-07, return_start=2027-02-10, return_end=2027-02-13
 
 **Formato da resposta:**
 - Use markdown (negrito, listas)
-- Liste no máximo 5-10 melhores opções
-- Para cada: **rota** · **data** · **preço** · **cia**
-- Se for LATAM, mostre também estimativa de milhas
+- Liste 5-8 melhores opções (pacotes completos ida+volta, não só trechos soltos)
+- Para cada pacote: **origem → destino** · ida em `DD/MM` · volta em `DD/MM` (X dias) · **R$ total** · cia
+- Se for LATAM, mostre estimativa de milhas do total
+- Destaque o **campeão** (mais barato) e adicione alternativas relevantes
 - Sugira próximas perguntas úteis no final
 
 **Se não houver dados:**
-- Diga claramente que não temos informação na base
-- Sugira rotas próximas/alternativas que existam
+- Diga claramente e sugira alternativas (destinos próximos, outras datas)
 
-**Resuma respostas** — seja direto. Ano atual: 2026. Considere datas futuras (não sugira datas no passado).
+**Resuma** — seja direto. Ano atual: **2026**. Nunca sugira datas passadas. Hoje é depois de abril/2026.
 """
 
 
