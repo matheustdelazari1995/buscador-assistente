@@ -100,20 +100,25 @@ def search_flights(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
     max_price_brl: Optional[int] = None,
-    scopes: Optional[list[str]] = None,  # subset de ["latam_nacional","latam_internacional","geral_nacional","geral_internacional"]
+    scopes: Optional[list[str]] = None,
     limit: int = 20,
 ) -> list[dict]:
-    """Busca voos que baterem com os filtros. Retorna lista de dicts
-    ordenada por preço crescente."""
+    """Retorna entradas de preço ordenadas por preço crescente.
+
+    IMPORTANTE — cada resultado tem `pricing_type`:
+
+    - `round_trip_bundled` (internacional): o preço JÁ é da viagem
+      completa ida+volta. `date` é a ida; `inbound_date` é a volta
+      calculada (ida + `stay_days`). `price_brl` é o total.
+    - `one_way` (nacional): preço é de 1 trecho. Não confunde com total —
+      se quiser ida+volta, use `find_trip_combinations`.
+    """
+    from datetime import date as _d, timedelta as _td
     reload_if_stale()
 
     orig_set = _iata_set(origins)
     dest_set = _iata_set(dests)
-    if scopes:
-        scope_set = set(scopes)
-    else:
-        scope_set = set(_bases().keys())
-
+    scope_set = set(scopes) if scopes else set(_bases().keys())
     d0 = date_start
     d1 = date_end
 
@@ -123,53 +128,97 @@ def search_flights(
         entry = _CACHE.get(scope)
         if not entry:
             continue
-        routes = entry["routes"]
-        res_all = entry["results"]
-
-        for rid, r in routes.items():
+        for rid, r in entry["routes"].items():
             if orig_set and r["origin"].upper() not in orig_set:
                 continue
             if dest_set and r["dest"].upper() not in dest_set:
                 continue
-            res = res_all.get(rid)
+            res = entry["results"].get(rid)
             if not res:
                 continue
 
-            # Outbound + inbound (dependendo da direction)
-            for leg_key, leg_data in (("outbound", res.get("outbound")), ("inbound", res.get("inbound"))):
-                if not leg_data:
+            # Formato round-trip bundled (internacional)?
+            by_dur_raw = res.get("outbound_by_duration") or {}
+            by_dur = {}
+            for k, v in by_dur_raw.items():
+                try:
+                    dur = int(k)
+                except (ValueError, TypeError):
                     continue
-                # Se inbound, origem/destino invertidos
-                if leg_key == "inbound":
-                    leg_orig, leg_dest = r["dest"].upper(), r["origin"].upper()
-                    # Re-filtro com orientação invertida
-                    if orig_set and leg_orig not in orig_set:
-                        continue
-                    if dest_set and leg_dest not in dest_set:
-                        continue
-                else:
-                    leg_orig, leg_dest = r["origin"].upper(), r["dest"].upper()
+                if v:
+                    by_dur[dur] = v
 
-                for iso, price in leg_data.items():
+            if by_dur:
+                # Round-trip bundled: cada data → melhor duração (menor preço)
+                best_per_iso: dict[str, tuple[int, int]] = {}  # iso → (dur, price)
+                for dur, prices in by_dur.items():
+                    for iso, p in prices.items():
+                        cur = best_per_iso.get(iso)
+                        if cur is None or p < cur[1]:
+                            best_per_iso[iso] = (dur, p)
+
+                for iso, (dur, price) in best_per_iso.items():
                     if d0 and iso < d0:
                         continue
                     if d1 and iso > d1:
                         continue
                     if max_price_brl and price > max_price_brl:
                         continue
+                    try:
+                        out_d = _d.fromisoformat(iso)
+                        ret_iso = (out_d + _td(days=dur)).isoformat()
+                    except Exception:
+                        continue
                     results.append({
-                        "origin": leg_orig,
-                        "dest": leg_dest,
-                        "date": iso,
-                        "price_brl": price,
+                        "origin": r["origin"].upper(),
+                        "dest": r["dest"].upper(),
+                        "date": iso,               # data de ida
+                        "inbound_date": ret_iso,    # data de volta calculada
+                        "stay_days": dur,
+                        "price_brl": price,         # total ida+volta
                         "airline": r.get("airline"),
                         "cabin": r.get("cabin"),
-                        "direction": leg_key,
                         "scope": scope,
                         "route_id": rid,
+                        "pricing_type": "round_trip_bundled",
                     })
+            else:
+                # One-way legs (nacional): retorna cada trecho como entrada separada
+                for leg_key, leg_data in (
+                    ("outbound", res.get("outbound")),
+                    ("inbound", res.get("inbound")),
+                ):
+                    if not leg_data:
+                        continue
+                    if leg_key == "inbound":
+                        leg_orig, leg_dest = r["dest"].upper(), r["origin"].upper()
+                        if orig_set and leg_orig not in orig_set:
+                            continue
+                        if dest_set and leg_dest not in dest_set:
+                            continue
+                    else:
+                        leg_orig, leg_dest = r["origin"].upper(), r["dest"].upper()
 
-    # Ordena por preço crescente
+                    for iso, price in leg_data.items():
+                        if d0 and iso < d0:
+                            continue
+                        if d1 and iso > d1:
+                            continue
+                        if max_price_brl and price > max_price_brl:
+                            continue
+                        results.append({
+                            "origin": leg_orig,
+                            "dest": leg_dest,
+                            "date": iso,
+                            "price_brl": price,
+                            "airline": r.get("airline"),
+                            "cabin": r.get("cabin"),
+                            "direction": leg_key,
+                            "scope": scope,
+                            "route_id": rid,
+                            "pricing_type": "one_way",
+                        })
+
     results.sort(key=lambda x: x["price_brl"])
     return results[:limit]
 
@@ -198,13 +247,19 @@ def find_trip_combinations(
     scopes: Optional[list[str]] = None,
     limit: int = 15,
 ) -> list[dict]:
-    """Combina pares ida+volta da mesma rota e retorna ordenados por preço total.
+    """Combina pares ida+volta e retorna ordenados por preço total.
 
-    Uma combinação é um {outbound_date, inbound_date} da mesma rota onde
-    inbound_date > outbound_date. Usado pra perguntas tipo 'ir no Carnaval
-    e voltar depois do feriado'.
+    Trata 2 estruturas de preço distintas:
+
+    - **Internacional (round-trip bundled):** quando existe `outbound_by_duration`
+      nos resultados, cada entrada `{duration: {date: price}}` é JÁ o preço total
+      da viagem ida+volta (LATAM internacional busca roundtrip direto). Aqui a
+      data de volta é calculada como `outbound_date + duration dias`.
+    - **Nacional (one-way legs):** cada data de `outbound` é o preço de 1 trecho;
+      a volta é buscada separadamente invertendo origem/destino e o preço total
+      é a SOMA dos 2 trechos.
     """
-    from datetime import date as _d
+    from datetime import date as _d, timedelta as _td
     reload_if_stale()
 
     orig_set = _iata_set(origins)
@@ -224,53 +279,107 @@ def find_trip_combinations(
             res = entry["results"].get(rid)
             if not res:
                 continue
-            out_prices = res.get("outbound") or {}
-            ret_prices = res.get("inbound") or {}
-            if not out_prices or not ret_prices:
-                continue
 
-            for out_date, out_price in out_prices.items():
-                if outbound_start and out_date < outbound_start:
-                    continue
-                if outbound_end and out_date > outbound_end:
-                    continue
+            # Detecta qual formato de preço a rota tem
+            by_dur_raw = res.get("outbound_by_duration") or {}
+            by_dur: dict[int, dict[str, int]] = {}
+            for k, v in by_dur_raw.items():
                 try:
-                    out_d = _d.fromisoformat(out_date)
-                except Exception:
+                    dur = int(k)
+                except (ValueError, TypeError):
                     continue
-                for ret_date, ret_price in ret_prices.items():
-                    if return_start and ret_date < return_start:
+                if v:
+                    by_dur[dur] = v
+
+            if by_dur:
+                # ========== Round-trip bundled (internacional) ==========
+                # Preço JÁ é total ida+volta. Data de volta = ida + duração.
+                for dur, prices in by_dur.items():
+                    if min_stay_days is not None and dur < min_stay_days:
                         continue
-                    if return_end and ret_date > return_end:
+                    if max_stay_days is not None and dur > max_stay_days:
+                        continue
+                    for out_iso, total_price in prices.items():
+                        if outbound_start and out_iso < outbound_start:
+                            continue
+                        if outbound_end and out_iso > outbound_end:
+                            continue
+                        try:
+                            out_d = _d.fromisoformat(out_iso)
+                        except Exception:
+                            continue
+                        ret_d = out_d + _td(days=dur)
+                        ret_iso = ret_d.isoformat()
+                        if return_start and ret_iso < return_start:
+                            continue
+                        if return_end and ret_iso > return_end:
+                            continue
+                        if max_total_brl is not None and total_price > max_total_brl:
+                            continue
+                        combos.append({
+                            "origin": r["origin"].upper(),
+                            "dest": r["dest"].upper(),
+                            "outbound_date": out_iso,
+                            "inbound_date": ret_iso,
+                            "total_price_brl": total_price,
+                            "stay_days": dur,
+                            "airline": r.get("airline"),
+                            "cabin": r.get("cabin"),
+                            "scope": scope,
+                            "route_id": rid,
+                            "pricing_type": "round_trip_bundled",
+                            # Não expomos outbound/inbound_price separado —
+                            # o scrape do internacional não dá isso.
+                        })
+            else:
+                # ========== One-way legs (nacional) ==========
+                out_prices = res.get("outbound") or {}
+                ret_prices = res.get("inbound") or {}
+                if not out_prices or not ret_prices:
+                    continue
+                for out_iso, out_price in out_prices.items():
+                    if outbound_start and out_iso < outbound_start:
+                        continue
+                    if outbound_end and out_iso > outbound_end:
                         continue
                     try:
-                        ret_d = _d.fromisoformat(ret_date)
+                        out_d = _d.fromisoformat(out_iso)
                     except Exception:
                         continue
-                    if ret_d <= out_d:
-                        continue  # volta tem que ser depois da ida
-                    stay = (ret_d - out_d).days
-                    if min_stay_days is not None and stay < min_stay_days:
-                        continue
-                    if max_stay_days is not None and stay > max_stay_days:
-                        continue
-                    total = out_price + ret_price
-                    if max_total_brl is not None and total > max_total_brl:
-                        continue
-                    combos.append({
-                        "origin": r["origin"].upper(),
-                        "dest": r["dest"].upper(),
-                        "outbound_date": out_date,
-                        "outbound_price_brl": out_price,
-                        "inbound_date": ret_date,
-                        "inbound_price_brl": ret_price,
-                        "total_price_brl": total,
-                        "stay_days": stay,
-                        "airline": r.get("airline"),
-                        "cabin": r.get("cabin"),
-                        "scope": scope,
-                        "route_id": rid,
-                    })
+                    for ret_iso, ret_price in ret_prices.items():
+                        if return_start and ret_iso < return_start:
+                            continue
+                        if return_end and ret_iso > return_end:
+                            continue
+                        try:
+                            ret_d = _d.fromisoformat(ret_iso)
+                        except Exception:
+                            continue
+                        if ret_d <= out_d:
+                            continue
+                        stay = (ret_d - out_d).days
+                        if min_stay_days is not None and stay < min_stay_days:
+                            continue
+                        if max_stay_days is not None and stay > max_stay_days:
+                            continue
+                        total = out_price + ret_price
+                        if max_total_brl is not None and total > max_total_brl:
+                            continue
+                        combos.append({
+                            "origin": r["origin"].upper(),
+                            "dest": r["dest"].upper(),
+                            "outbound_date": out_iso,
+                            "outbound_price_brl": out_price,
+                            "inbound_date": ret_iso,
+                            "inbound_price_brl": ret_price,
+                            "total_price_brl": total,
+                            "stay_days": stay,
+                            "airline": r.get("airline"),
+                            "cabin": r.get("cabin"),
+                            "scope": scope,
+                            "route_id": rid,
+                            "pricing_type": "two_one_ways",
+                        })
 
     combos.sort(key=lambda x: x["total_price_brl"])
     return combos[:limit]
