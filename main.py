@@ -45,7 +45,7 @@ if not ANTHROPIC_API_KEY:
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-MODEL = "claude-sonnet-4-5"  # bom/barato
+MODEL = "claude-haiku-4-5"  # ~3-5x mais barato que Sonnet, ótimo pra tool-calling estruturado
 MAX_TOKENS = 2048
 MAX_TOOL_ITERATIONS = 8
 
