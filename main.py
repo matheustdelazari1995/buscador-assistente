@@ -14,10 +14,12 @@ import json
 import os
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from anthropic import Anthropic
+
+import whatsapp as wa
 
 from data_loader import (
     search_flights, find_trip_combinations,
@@ -360,19 +362,43 @@ async def health():
     return {"ok": True, "scopes": list_scopes()}
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest) -> ChatResponse:
+WHATSAPP_PROMPT_SUFFIX = """
+
+**Formato especial WhatsApp (use SEMPRE quando receber instrução de WhatsApp):**
+- NUNCA use markdown de títulos (`#`, `##`) — WhatsApp não renderiza
+- Use `*texto*` (um asterisco) pra negrito, NÃO `**texto**`
+- Use `_texto_` pra itálico
+- Listas usam `-` ou `•`
+- Respostas **curtas** (5-10 linhas) — usuário está no celular
+- Se tiver muitas opções, mostre só as 3-5 melhores
+- Sem separadores `---`
+- Pode usar emojis moderadamente 😊
+"""
+
+
+async def run_chat(message: str, history: list[dict], scope_hint: Optional[str] = None,
+                    format_hint: str = "markdown") -> tuple[str, list[dict]]:
+    """Executa o loop de tool-calling e retorna (reply, tool_calls_log).
+
+    format_hint: "markdown" (web) ou "whatsapp" (curto + formato WA).
+    """
     if client is None:
-        raise HTTPException(500, "ANTHROPIC_API_KEY não configurada")
+        raise RuntimeError("ANTHROPIC_API_KEY não configurada")
 
-    # Monta histórico + nova mensagem
+    system = SYSTEM_PROMPT
+    if format_hint == "whatsapp":
+        system = SYSTEM_PROMPT + WHATSAPP_PROMPT_SUFFIX
+
     messages = []
-    for m in req.history[-20:]:  # limita últimas 20 pra controlar custo
-        messages.append({"role": m.role, "content": m.content})
+    for m in history[-20:]:
+        messages.append({"role": m["role"] if isinstance(m, dict) else m.role,
+                         "content": m["content"] if isinstance(m, dict) else m.content})
 
-    user_msg = req.message
-    if req.scope_hint:
-        user_msg = f"[contexto: usuário está olhando o dashboard '{req.scope_hint}']\n\n{user_msg}"
+    user_msg = message
+    if scope_hint:
+        user_msg = f"[contexto: usuário está olhando o dashboard '{scope_hint}']\n\n{user_msg}"
+    if format_hint == "whatsapp":
+        user_msg = f"[canal: WhatsApp — responda curto e com formato WA]\n\n{user_msg}"
     messages.append({"role": "user", "content": user_msg})
 
     tool_calls_log: list[dict] = []
@@ -381,19 +407,17 @@ async def chat(req: ChatRequest) -> ChatResponse:
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             messages=messages,
         )
 
         if response.stop_reason == "end_turn":
             text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-            return ChatResponse(reply="\n".join(text_parts), tool_calls=tool_calls_log)
+            return "\n".join(text_parts), tool_calls_log
 
         if response.stop_reason == "tool_use":
-            # Anexa o "assistant" message ao histórico
             messages.append({"role": "assistant", "content": response.content})
-            # Executa cada tool_use e monta o user message com tool_results
             tool_results = []
             for block in response.content:
                 if getattr(block, "type", None) == "tool_use":
@@ -406,19 +430,99 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": json.dumps(result, ensure_ascii=False)[:8000],  # trunca pra evitar context explosion
+                        "content": json.dumps(result, ensure_ascii=False)[:8000],
                     })
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # stop_reason inesperado
         text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-        return ChatResponse(reply="\n".join(text_parts) or "(sem resposta)", tool_calls=tool_calls_log)
+        return "\n".join(text_parts) or "(sem resposta)", tool_calls_log
 
-    return ChatResponse(
-        reply="(limite de iterações excedido — tente reformular a pergunta)",
-        tool_calls=tool_calls_log,
+    return "(limite de iterações excedido — tente reformular a pergunta)", tool_calls_log
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> ChatResponse:
+    try:
+        history = [{"role": m.role, "content": m.content} for m in req.history]
+        reply, log = await run_chat(req.message, history, req.scope_hint, format_hint="markdown")
+        return ChatResponse(reply=reply, tool_calls=log)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+
+# ===========================================================================
+# WhatsApp — webhook da Evolution API
+# ===========================================================================
+
+
+async def _handle_whatsapp_message(phone: str, text: Optional[str], message_type: str):
+    """Executado em background após retornar 200 do webhook."""
+    try:
+        # 1) Não-texto → fallback curto
+        if text is None:
+            await wa.send_whatsapp_text(phone, wa.NON_TEXT_REPLY)
+            return
+
+        # 2) Whitelist
+        if not wa.is_allowed(phone):
+            await wa.send_whatsapp_text(phone, wa.NOT_WHITELISTED_REPLY)
+            return
+
+        # 3) Daily limit
+        count = wa.increment_daily(phone)
+        if count > wa.DAILY_LIMIT_PER_USER:
+            await wa.send_whatsapp_text(phone, wa.DAILY_LIMIT_REPLY)
+            return
+
+        # 4) Persiste a msg do usuário + puxa histórico
+        wa.append_message(phone, "user", text)
+        history = wa.get_history(phone)[:-1]  # histórico ANTES dessa msg (já foi salva agora)
+
+        # 5) Chama o agente com formato WhatsApp
+        reply, _log = await run_chat(
+            message=text,
+            history=history,
+            scope_hint=None,
+            format_hint="whatsapp",
+        )
+
+        # 6) Persiste + envia
+        wa.append_message(phone, "assistant", reply)
+        await wa.send_whatsapp_text(phone, reply)
+    except Exception as e:
+        print(f"[whatsapp] erro processando msg de {phone}: {type(e).__name__}: {e}")
+        # Tenta avisar o usuário
+        try:
+            await wa.send_whatsapp_text(
+                phone, "⚠️ Ops, tive um problema técnico. Tenta de novo em alguns instantes.")
+        except Exception:
+            pass
+
+
+@app.post("/api/whatsapp/webhook")
+async def whatsapp_webhook(request: Request, background: BackgroundTasks):
+    """Recebe eventos da Evolution API (WhatsApp). Valida o secret via
+    query param `?secret=...` e processa em background pra responder 200 rápido."""
+    secret = request.query_params.get("secret", "")
+    if secret != wa.WEBHOOK_SECRET:
+        raise HTTPException(401, "invalid secret")
+
+    try:
+        event = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid json")
+
+    parsed = wa.parse_incoming(event)
+    if parsed is None:
+        return {"ok": True, "skipped": True}
+
+    # Dispara em background pra Evolution não dar timeout
+    background.add_task(
+        _handle_whatsapp_message,
+        parsed["phone"], parsed["text"], parsed["message_type"],
     )
+    return {"ok": True, "queued": True}
 
 
 if __name__ == "__main__":
