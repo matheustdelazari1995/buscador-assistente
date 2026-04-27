@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from anthropic import Anthropic
 
 import whatsapp as wa
+import analytics
 
 from data_loader import (
     search_flights, find_trip_combinations,
@@ -548,6 +549,68 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks):
         parsed["phone"], parsed["text"], parsed["message_type"],
     )
     return {"ok": True, "queued": True}
+
+
+# ===========================================================================
+# Analytics — dashboard de histórico de preços
+# ===========================================================================
+
+
+@app.get("/api/analytics/top-drops")
+async def api_top_drops(scope: str = "all", limit: int = 10, min_drop_pct: float = 0.0):
+    """Top N rotas com maior queda de preço vs snapshot anterior.
+
+    `scope`: 'all' = agrega 4 scopes; ou 'latam_nacional', 'latam_internacional',
+    'geral_nacional', 'geral_internacional'.
+    `min_drop_pct`: filtra resultados com queda <= esse %. Ex: -10 = só rotas que caíram >=10%.
+    """
+    try:
+        if scope == "all":
+            return {"items": analytics.all_scopes_top_drops(limit=limit, min_drop_pct=min_drop_pct)}
+        return {"items": analytics.top_drops(scope, limit=limit, min_drop_pct=min_drop_pct)}
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/analytics/below-average")
+async def api_below_avg(scope: str = "all", limit: int = 10, days: int = 30, min_pct_below: float = 0.0):
+    """Rotas com preço atual mais abaixo da média histórica.
+
+    `min_pct_below`: filtra com queda >= esse %. Ex: -15 = só rotas >=15% abaixo da média.
+    """
+    try:
+        if scope == "all":
+            return {"items": analytics.all_scopes_below_average(limit=limit, days=days, min_pct_below=min_pct_below)}
+        return {"items": analytics.most_below_average(scope, limit=limit, days=days, min_pct_below=min_pct_below)}
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/analytics/cheapest")
+async def api_cheapest(scope: str = "all", limit: int = 10):
+    """Top N rotas mais baratas no momento."""
+    try:
+        if scope == "all":
+            return {"items": analytics.all_scopes_cheapest(limit=limit)}
+        return {"items": analytics.cheapest_now(scope, limit=limit)}
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/analytics/route/{scope}/{route_id}/history")
+async def api_route_history(scope: str, route_id: str, days: int = 30):
+    """Histórico detalhado de uma rota: pontos de preço + estatísticas."""
+    try:
+        return analytics.route_history(scope, route_id, days=days)
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.post("/api/analytics/cache/invalidate")
+async def api_invalidate_cache():
+    """Limpa o cache de analytics (útil pra testes)."""
+    analytics.invalidate_cache()
+    return {"ok": True}
 
 
 if __name__ == "__main__":
