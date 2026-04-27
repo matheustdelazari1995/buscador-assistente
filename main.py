@@ -557,42 +557,52 @@ async def whatsapp_webhook(request: Request, background: BackgroundTasks):
 
 
 @app.get("/api/analytics/top-drops")
-async def api_top_drops(scope: str = "all", limit: int = 10, min_drop_pct: float = 0.0):
+async def api_top_drops(scope: str = "all", limit: int = 10, min_drop_pct: float = 0.0,
+                         origin: Optional[str] = None):
     """Top N rotas com maior queda de preço vs snapshot anterior.
 
-    `scope`: 'all' = agrega 4 scopes; ou 'latam_nacional', 'latam_internacional',
-    'geral_nacional', 'geral_internacional'.
+    `scope`: 'all' = agrega 4 scopes; ou um scope específico.
     `min_drop_pct`: filtra resultados com queda <= esse %. Ex: -10 = só rotas que caíram >=10%.
+    `origin`: IATA pra filtrar voos saindo de uma cidade (ex: 'GRU').
     """
     try:
         if scope == "all":
-            return {"items": analytics.all_scopes_top_drops(limit=limit, min_drop_pct=min_drop_pct)}
-        return {"items": analytics.top_drops(scope, limit=limit, min_drop_pct=min_drop_pct)}
+            return {"items": analytics.all_scopes_top_drops(limit=limit, min_drop_pct=min_drop_pct, origin=origin)}
+        return {"items": analytics.top_drops(scope, limit=limit, min_drop_pct=min_drop_pct, origin=origin)}
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 
 @app.get("/api/analytics/below-average")
-async def api_below_avg(scope: str = "all", limit: int = 10, days: int = 30, min_pct_below: float = 0.0):
-    """Rotas com preço atual mais abaixo da média histórica.
-
-    `min_pct_below`: filtra com queda >= esse %. Ex: -15 = só rotas >=15% abaixo da média.
-    """
+async def api_below_avg(scope: str = "all", limit: int = 10, days: int = 30,
+                         min_pct_below: float = 0.0, origin: Optional[str] = None):
+    """Rotas com preço atual mais abaixo da média histórica."""
     try:
         if scope == "all":
-            return {"items": analytics.all_scopes_below_average(limit=limit, days=days, min_pct_below=min_pct_below)}
-        return {"items": analytics.most_below_average(scope, limit=limit, days=days, min_pct_below=min_pct_below)}
+            return {"items": analytics.all_scopes_below_average(
+                limit=limit, days=days, min_pct_below=min_pct_below, origin=origin)}
+        return {"items": analytics.most_below_average(
+            scope, limit=limit, days=days, min_pct_below=min_pct_below, origin=origin)}
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 
 @app.get("/api/analytics/cheapest")
-async def api_cheapest(scope: str = "all", limit: int = 10):
+async def api_cheapest(scope: str = "all", limit: int = 10, origin: Optional[str] = None):
     """Top N rotas mais baratas no momento."""
     try:
         if scope == "all":
-            return {"items": analytics.all_scopes_cheapest(limit=limit)}
-        return {"items": analytics.cheapest_now(scope, limit=limit)}
+            return {"items": analytics.all_scopes_cheapest(limit=limit, origin=origin)}
+        return {"items": analytics.cheapest_now(scope, limit=limit, origin=origin)}
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/analytics/origins")
+async def api_origins(scope: str = "all"):
+    """Lista de cidades de origem (IATAs) disponíveis pra filtrar."""
+    try:
+        return {"origins": analytics.list_origins(scope)}
     except Exception as e:
         raise HTTPException(500, f"{type(e).__name__}: {e}")
 

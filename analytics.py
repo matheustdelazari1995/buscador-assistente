@@ -97,13 +97,14 @@ def _enrich(scope: str, items: list[dict]) -> list[dict]:
 # ===========================================================================
 
 
-def top_drops(scope: str, limit: int = 10, min_drop_pct: float = 0.0) -> list[dict]:
+def top_drops(scope: str, limit: int = 10, min_drop_pct: float = 0.0,
+              origin: Optional[str] = None) -> list[dict]:
     """Rotas onde o preço mínimo CAIU mais (em % vs snapshot anterior).
 
-    Retorna ordenado por % de queda (mais negativo primeiro).
-    `min_drop_pct`: filtra resultados com queda menor que esse threshold (em %, negativo).
+    `min_drop_pct`: filtra resultados com queda menor que esse threshold (negativo).
+    `origin`: IATA de origem (ex: 'GRU') pra filtrar só voos saindo dali.
     """
-    cache_key = f"drops:{scope}:{limit}:{min_drop_pct}"
+    cache_key = f"drops:{scope}:{limit}:{min_drop_pct}:{origin or ''}"
 
     def run():
         with _conn(scope) as c:
@@ -139,22 +140,27 @@ def top_drops(scope: str, limit: int = 10, min_drop_pct: float = 0.0) -> list[di
                 ORDER BY delta_pct ASC
                 LIMIT ?
                 """,
-                (min_drop_pct, limit * 3),  # pega 3x pra compensar rotas deletadas
+                # Quando filtra por origem, pega mais (até 200) pra não esvaziar
+                (min_drop_pct, 200 if origin else limit * 3),
             )
             rows = [dict(r) for r in cur.fetchall()]
-        return _enrich(scope, rows)[:limit]
+        enriched = _enrich(scope, rows)
+        if origin:
+            enriched = [r for r in enriched if r.get("origin") == origin.upper()]
+        return enriched[:limit]
 
     return _cached(cache_key, run)
 
 
 def most_below_average(scope: str, limit: int = 10, days: int = 30,
-                       min_pct_below: float = 0.0) -> list[dict]:
+                       min_pct_below: float = 0.0,
+                       origin: Optional[str] = None) -> list[dict]:
     """Rotas onde o preço atual está mais abaixo da média histórica dos últimos N dias.
 
     `min_pct_below`: filtra rotas onde a queda é menor que esse threshold (negativo).
-    Ex: -10 = só rotas com preço >=10% abaixo da média.
+    `origin`: IATA pra filtrar só voos saindo dali.
     """
-    cache_key = f"belowavg:{scope}:{limit}:{days}:{min_pct_below}"
+    cache_key = f"belowavg:{scope}:{limit}:{days}:{min_pct_below}:{origin or ''}"
 
     def run():
         with _conn(scope) as c:
@@ -194,17 +200,20 @@ def most_below_average(scope: str, limit: int = 10, days: int = 30,
                 ORDER BY pct_vs_avg ASC
                 LIMIT ?
                 """,
-                (f"-{days}", min_pct_below, limit * 3),
+                (f"-{days}", min_pct_below, 200 if origin else limit * 3),
             )
             rows = [dict(r) for r in cur.fetchall()]
-        return _enrich(scope, rows)[:limit]
+        enriched = _enrich(scope, rows)
+        if origin:
+            enriched = [r for r in enriched if r.get("origin") == origin.upper()]
+        return enriched[:limit]
 
     return _cached(cache_key, run)
 
 
-def cheapest_now(scope: str, limit: int = 10) -> list[dict]:
+def cheapest_now(scope: str, limit: int = 10, origin: Optional[str] = None) -> list[dict]:
     """Top N rotas mais baratas no momento (último snapshot)."""
-    cache_key = f"cheapest:{scope}:{limit}"
+    cache_key = f"cheapest:{scope}:{limit}:{origin or ''}"
 
     def run():
         with _conn(scope) as c:
@@ -222,12 +231,34 @@ def cheapest_now(scope: str, limit: int = 10) -> list[dict]:
                 ORDER BY s.min_price ASC
                 LIMIT ?
                 """,
-                (limit * 3,),
+                (200 if origin else limit * 3,),
             )
             rows = [dict(r) for r in cur.fetchall()]
-        return _enrich(scope, rows)[:limit]
+        enriched = _enrich(scope, rows)
+        if origin:
+            enriched = [r for r in enriched if r.get("origin") == origin.upper()]
+        return enriched[:limit]
 
     return _cached(cache_key, run)
+
+
+def list_origins(scope: str = "all") -> list[str]:
+    """Lista de IATAs de origem únicos com pelo menos 1 snapshot."""
+    cache_key = f"origins:{scope}"
+
+    def run():
+        scopes = list(_scope_bases().keys()) if scope == "all" else [scope]
+        all_origins = set()
+        for sc in scopes:
+            reload_if_stale()
+            routes = (_CACHE.get(sc) or {}).get("routes", {})
+            for rid, r in routes.items():
+                origin = r.get("origin")
+                if origin:
+                    all_origins.add(origin.upper())
+        return sorted(all_origins)
+
+    return _cached(cache_key, run, ttl=600)
 
 
 def route_history(scope: str, route_id: str, days: int = 30) -> dict:
@@ -267,34 +298,37 @@ def route_history(scope: str, route_id: str, days: int = 30) -> dict:
     return _cached(cache_key, run, ttl=60)  # detalhe atualiza mais rápido
 
 
-def all_scopes_top_drops(limit: int = 10, min_drop_pct: float = 0.0) -> list[dict]:
+def all_scopes_top_drops(limit: int = 10, min_drop_pct: float = 0.0,
+                          origin: Optional[str] = None) -> list[dict]:
     """Junta top drops dos 4 scopes e retorna os mais expressivos no agregado."""
     all_results = []
     for scope in _scope_bases().keys():
         try:
-            all_results.extend(top_drops(scope, limit=limit, min_drop_pct=min_drop_pct))
+            all_results.extend(top_drops(scope, limit=limit, min_drop_pct=min_drop_pct, origin=origin))
         except Exception as e:
             print(f"[analytics] erro em top_drops({scope}): {e}")
     all_results.sort(key=lambda x: x.get("delta_pct") or 0)
     return all_results[:limit]
 
 
-def all_scopes_below_average(limit: int = 10, days: int = 30, min_pct_below: float = 0.0) -> list[dict]:
+def all_scopes_below_average(limit: int = 10, days: int = 30, min_pct_below: float = 0.0,
+                              origin: Optional[str] = None) -> list[dict]:
     all_results = []
     for scope in _scope_bases().keys():
         try:
-            all_results.extend(most_below_average(scope, limit=limit, days=days, min_pct_below=min_pct_below))
+            all_results.extend(most_below_average(
+                scope, limit=limit, days=days, min_pct_below=min_pct_below, origin=origin))
         except Exception as e:
             print(f"[analytics] erro em below_avg({scope}): {e}")
     all_results.sort(key=lambda x: x.get("pct_vs_avg") or 0)
     return all_results[:limit]
 
 
-def all_scopes_cheapest(limit: int = 10) -> list[dict]:
+def all_scopes_cheapest(limit: int = 10, origin: Optional[str] = None) -> list[dict]:
     all_results = []
     for scope in _scope_bases().keys():
         try:
-            all_results.extend(cheapest_now(scope, limit=limit))
+            all_results.extend(cheapest_now(scope, limit=limit, origin=origin))
         except Exception as e:
             print(f"[analytics] erro em cheapest({scope}): {e}")
     all_results.sort(key=lambda x: x.get("current_price") or 99999999)
