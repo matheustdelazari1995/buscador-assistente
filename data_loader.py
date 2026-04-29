@@ -390,15 +390,19 @@ def quiz_search(
     origins: Optional[list[str]] = None,       # ['GIG'] ou None pra qualquer
     dests: Optional[list[str]] = None,         # ['FOR','REC',...] ou None
     months: Optional[list[int]] = None,        # ex: [7, 8] pra julho+agosto
-    year: Optional[int] = None,                # default 2026
+    year: Optional[int] = None,                # opcional: ano âncora (default = ano atual).
+                                                # Quando month < mês atual, usa year+1.
     limit: int = 10,
 ) -> list[dict]:
     """Busca AGREGADA POR ROTA pra usar no funil de quiz.
 
     `months` aceita lista (multi-mês) — datas são filtradas pra estarem
-    em PELO MENOS UM dos meses passados. Sem months → ano inteiro.
+    em PELO MENOS UM dos meses passados. O ano de cada mês é derivado
+    automaticamente: meses >= mês atual ficam no ano corrente; meses
+    < mês atual avançam pra ano+1 (rolling 12 meses pra frente).
+    Sem months → ano inteiro do `year` (ou ano atual).
     """
-    from datetime import date as _d, timedelta as _td
+    from datetime import date as _d, timedelta as _td, datetime as _dt
     reload_if_stale()
 
     orig_set = _iata_set(origins)
@@ -406,12 +410,16 @@ def quiz_search(
     scope_set = set(scopes) if scopes else set(_bases().keys())
 
     # Computa ranges de datas: lista de (start_iso, end_iso) — 1 por mês.
-    # Sem months → 1 range que cobre o ano inteiro.
+    # Cada mês tem ano derivado: se m >= mês_atual → year, senão → year+1.
     ranges: list[tuple[str, str]] = []
-    if year and months:
+    if months:
+        today = _dt.now().date()
+        anchor_year = year if year else today.year
+        cur_month = today.month
         for m in months:
-            ds = _d(year, m, 1)
-            de = _d(year + (1 if m == 12 else 0),
+            y = anchor_year if m >= cur_month else anchor_year + 1
+            ds = _d(y, m, 1)
+            de = _d(y + (1 if m == 12 else 0),
                     1 if m == 12 else m + 1, 1) - _td(days=1)
             ranges.append((ds.isoformat(), de.isoformat()))
     elif year:
