@@ -435,23 +435,67 @@ def quiz_search(
             if not res:
                 continue
 
-            # Junta preços (out + inb + by_duration agregado em out)
             out = res.get("outbound") or {}
             inb = res.get("inbound") or {}
-            all_prices: list[tuple[str, int]] = []
-            for d, p in out.items():
-                if (not date_start or d >= date_start) and (not date_end or d <= date_end):
-                    all_prices.append((d, p))
-            for d, p in inb.items():
-                if (not date_start or d >= date_start) and (not date_end or d <= date_end):
-                    all_prices.append((d, p))
-            if not all_prices:
-                continue
+            by_dur = res.get("outbound_by_duration") or {}
 
-            min_p_tuple = min(all_prices, key=lambda x: x[1])
-            min_price = min_p_tuple[1]
-            cheapest_date = min_p_tuple[0]
-            n_dates = len(all_prices)
+            def _in_range(date_iso: str) -> bool:
+                if date_start and date_iso < date_start: return False
+                if date_end and date_iso > date_end: return False
+                return True
+
+            out_in = [(d, p) for d, p in out.items() if _in_range(d)]
+            inb_in = [(d, p) for d, p in inb.items() if _in_range(d)]
+
+            # Computa min_price de acordo com tipo de rota:
+            # - intl bundled (`outbound_by_duration` existe): outbound já é total ida+volta
+            # - nacional roundtrip (out + inb separados): SOMA cheapest ida + cheapest volta
+            # - one-way: usa só o trecho disponível
+            min_price = None
+            cheapest_date = None
+            n_dates = 0
+            pricing_type = None
+
+            if by_dur:
+                # Internacional bundled — outbound já é total
+                if not out_in:
+                    continue
+                cheapest_out = min(out_in, key=lambda x: x[1])
+                min_price = cheapest_out[1]
+                cheapest_date = cheapest_out[0]
+                n_dates = len(out_in)
+                pricing_type = "round_trip_bundled"
+            elif out and inb:
+                # Nacional roundtrip — soma cheapest ida + cheapest volta
+                if not out_in:
+                    continue  # se não tem ida no range, ignora
+                cheapest_out = min(out_in, key=lambda x: x[1])
+                if inb_in:
+                    cheapest_inb = min(inb_in, key=lambda x: x[1])
+                else:
+                    # fallback: volta em qualquer data (caso filtro mês corte só ida)
+                    cheapest_inb_tuple = min(inb.items(), key=lambda x: x[1])
+                    cheapest_inb = cheapest_inb_tuple
+                min_price = cheapest_out[1] + cheapest_inb[1]
+                cheapest_date = cheapest_out[0]
+                n_dates = len(out_in)
+                pricing_type = "round_trip_sum"
+            elif out_in:
+                # Só ida
+                cheapest_out = min(out_in, key=lambda x: x[1])
+                min_price = cheapest_out[1]
+                cheapest_date = cheapest_out[0]
+                n_dates = len(out_in)
+                pricing_type = "one_way"
+            elif inb_in:
+                # Só volta
+                cheapest_inb = min(inb_in, key=lambda x: x[1])
+                min_price = cheapest_inb[1]
+                cheapest_date = cheapest_inb[0]
+                n_dates = len(inb_in)
+                pricing_type = "one_way"
+            else:
+                continue
 
             key = (scope, origin, dest, r.get("airline"))
             existing = by_route.get(key)
@@ -467,6 +511,7 @@ def quiz_search(
                     "min_price": min_price,
                     "cheapest_date": cheapest_date,
                     "n_dates": n_dates,
+                    "pricing_type": pricing_type,
                     "last_searched_at": r.get("last_searched_at"),
                 }
 

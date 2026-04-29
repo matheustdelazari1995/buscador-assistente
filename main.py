@@ -676,16 +676,47 @@ async def api_quiz_search(
 
 @app.get("/api/quiz/regions")
 async def api_quiz_regions():
-    """Lista de regiões disponíveis pra usar no quiz (com cidades)."""
-    from regions import IATA_NAMES
+    """Lista de regiões disponíveis pra usar no quiz, com categoria
+    (br | intl) pra filtrar dinamicamente conforme o scope escolhido."""
+    from regions import IATA_NAMES, BR_REGIONS
     out = {}
     for region_name, iatas in REGIONS.items():
         out[region_name] = {
             "name": region_name,
+            "category": "br" if region_name in BR_REGIONS else "intl",
             "iatas": iatas,
             "cities": [IATA_NAMES.get(i, i) for i in iatas],
         }
     return {"regions": out}
+
+
+@app.get("/api/quiz/route/{scope}/{route_id}/result")
+async def api_quiz_route_result(scope: str, route_id: str):
+    """Retorna o `result` completo (outbound/inbound/by_duration) de uma rota
+    pra renderizar o detalhe ao expandir card no quiz."""
+    from data_loader import _CACHE, reload_if_stale, _bases
+    if scope not in _bases():
+        raise HTTPException(400, f"scope inválido: {scope}")
+    reload_if_stale()
+    entry = _CACHE.get(scope) or {}
+    routes = entry.get("routes", {})
+    results = entry.get("results", {})
+    route = routes.get(route_id)
+    res = results.get(route_id)
+    if not route or not res:
+        raise HTTPException(404, "rota/result não encontrado")
+    return {
+        "route": {
+            "id": route_id,
+            "origin": route.get("origin"),
+            "dest": route.get("dest"),
+            "airline": route.get("airline"),
+            "cabin": route.get("cabin"),
+            "direction": route.get("direction"),
+            "trip_durations": route.get("trip_durations"),
+        },
+        "result": res,
+    }
 
 
 if __name__ == "__main__":

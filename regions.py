@@ -8,6 +8,11 @@ from datetime import date, timedelta
 from typing import Optional
 
 
+# Conjuntos pra classificar regiões em UI (filtros do quiz por scope)
+BR_REGIONS = {"nordeste", "sul", "sudeste", "centro_oeste", "norte"}
+INTL_REGIONS_HINT = None  # qualquer região não-BR é internacional
+
+
 REGIONS = {
     # Brasil
     "nordeste": ["FOR", "REC", "SSA", "NAT", "MCZ", "JPA", "AJU", "SLZ", "THE"],
