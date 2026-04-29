@@ -389,15 +389,14 @@ def quiz_search(
     scopes: Optional[list[str]] = None,        # subset de scopes (default: todos)
     origins: Optional[list[str]] = None,       # ['GIG'] ou None pra qualquer
     dests: Optional[list[str]] = None,         # ['FOR','REC',...] ou None
-    month: Optional[int] = None,               # 1-12 ou None
+    months: Optional[list[int]] = None,        # ex: [7, 8] pra julho+agosto
     year: Optional[int] = None,                # default 2026
     limit: int = 10,
 ) -> list[dict]:
     """Busca AGREGADA POR ROTA pra usar no funil de quiz.
 
-    Pra cada rota que matcha (origem/destino/scope), computa min_price,
-    n_dates, cheapest_date considerando datas de ida no mês/ano filtrado.
-    Retorna ordenado por min_price ASC. Limit pra paginar (10/30 etc).
+    `months` aceita lista (multi-mês) — datas são filtradas pra estarem
+    em PELO MENOS UM dos meses passados. Sem months → ano inteiro.
     """
     from datetime import date as _d, timedelta as _td
     reload_if_stale()
@@ -406,17 +405,26 @@ def quiz_search(
     dest_set = _iata_set(dests)
     scope_set = set(scopes) if scopes else set(_bases().keys())
 
-    # Computa range de datas pelo mês/ano (ou ano todo se sem mês)
-    date_start: Optional[str] = None
-    date_end: Optional[str] = None
-    if year:
-        if month:
-            ds = _d(year, month, 1)
-            de = _d(year + (1 if month == 12 else 0),
-                    1 if month == 12 else month + 1, 1) - _td(days=1)
-            date_start, date_end = ds.isoformat(), de.isoformat()
-        else:
-            date_start, date_end = f"{year}-01-01", f"{year}-12-31"
+    # Computa ranges de datas: lista de (start_iso, end_iso) — 1 por mês.
+    # Sem months → 1 range que cobre o ano inteiro.
+    ranges: list[tuple[str, str]] = []
+    if year and months:
+        for m in months:
+            ds = _d(year, m, 1)
+            de = _d(year + (1 if m == 12 else 0),
+                    1 if m == 12 else m + 1, 1) - _td(days=1)
+            ranges.append((ds.isoformat(), de.isoformat()))
+    elif year:
+        ranges.append((f"{year}-01-01", f"{year}-12-31"))
+    # se sem year e sem months: ranges vazio = sem filtro (todas as datas)
+
+    def _in_any_range(date_iso: str) -> bool:
+        if not ranges:
+            return True
+        for ds, de in ranges:
+            if ds <= date_iso <= de:
+                return True
+        return False
 
     by_route: dict[tuple, dict] = {}  # (scope, origin, dest, airline) -> agg
 
@@ -439,13 +447,8 @@ def quiz_search(
             inb = res.get("inbound") or {}
             by_dur = res.get("outbound_by_duration") or {}
 
-            def _in_range(date_iso: str) -> bool:
-                if date_start and date_iso < date_start: return False
-                if date_end and date_iso > date_end: return False
-                return True
-
-            out_in = [(d, p) for d, p in out.items() if _in_range(d)]
-            inb_in = [(d, p) for d, p in inb.items() if _in_range(d)]
+            out_in = [(d, p) for d, p in out.items() if _in_any_range(d)]
+            inb_in = [(d, p) for d, p in inb.items() if _in_any_range(d)]
 
             # Computa min_price de acordo com tipo de rota:
             # - intl bundled (`outbound_by_duration` existe): outbound já é total ida+volta

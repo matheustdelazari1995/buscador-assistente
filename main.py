@@ -634,16 +634,19 @@ async def api_quiz_search(
     origin: Optional[str] = None,        # IATA específico (ex: 'GIG')
     dest: Optional[str] = None,          # IATA específico
     dest_region: Optional[str] = None,   # 'nordeste', 'europa', 'caribe', 'sudeste_asiatico'...
-    month: Optional[int] = None,         # 1-12
-    year: Optional[int] = None,          # default: ano corrente
-    limit: int = 10,                     # 10 ou 30 (cap em 50 pra não estourar)
+    months: Optional[str] = None,        # CSV: '7' ou '7,8,9' (multi-mês)
+    month: Optional[int] = None,         # legado (1 mês). Use 'months' pra multi.
+    year: Optional[int] = None,          # default: ano corrente se month/months passado
+    limit: int = 10,                     # 10 ou 30 (cap em 50)
 ):
-    """Busca agregada por rota usando filtros do funil de quiz."""
+    """Busca agregada por rota usando filtros do funil de quiz.
+
+    `months` aceita CSV de meses (1-12). Pra um mês só, pode passar `month=N`.
+    """
     try:
         scope_list = [s.strip() for s in scopes.split(",")] if scopes else None
         orig_list = [origin.upper()] if origin else None
 
-        # Resolve destino: IATA OU região
         dest_list: Optional[list[str]] = None
         if dest:
             dest_list = [dest.upper()]
@@ -654,16 +657,23 @@ async def api_quiz_search(
                                           f"Disponíveis: {sorted(REGIONS.keys())}")
             dest_list = iatas
 
-        # Default: ano atual
+        # Multi-mês: aceita months (CSV) OU month (single, legado)
+        months_list: Optional[list[int]] = None
+        if months:
+            months_list = [int(m.strip()) for m in months.split(",") if m.strip()]
+        elif month is not None:
+            months_list = [month]
+
+        # Default ano atual se há filtro de mês
         from datetime import datetime as _dt
-        if year is None and month is not None:
+        if year is None and months_list:
             year = _dt.now().year
 
         items = quiz_search(
             scopes=scope_list,
             origins=orig_list,
             dests=dest_list,
-            month=month,
+            months=months_list,
             year=year,
             limit=min(limit, 50),
         )
