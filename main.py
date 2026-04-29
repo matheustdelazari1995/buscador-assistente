@@ -23,7 +23,7 @@ import whatsapp as wa
 import analytics
 
 from data_loader import (
-    search_flights, find_trip_combinations,
+    search_flights, find_trip_combinations, quiz_search,
     list_scopes, get_route_history, reload_if_stale,
 )
 from regions import (
@@ -621,6 +621,71 @@ async def api_invalidate_cache():
     """Limpa o cache de analytics (útil pra testes)."""
     analytics.invalidate_cache()
     return {"ok": True}
+
+
+# ===========================================================================
+# Quiz — funil de busca guiada
+# ===========================================================================
+
+
+@app.get("/api/quiz/search")
+async def api_quiz_search(
+    scopes: Optional[str] = None,        # CSV: 'latam_nacional,latam_internacional'
+    origin: Optional[str] = None,        # IATA específico (ex: 'GIG')
+    dest: Optional[str] = None,          # IATA específico
+    dest_region: Optional[str] = None,   # 'nordeste', 'europa', 'caribe', 'sudeste_asiatico'...
+    month: Optional[int] = None,         # 1-12
+    year: Optional[int] = None,          # default: ano corrente
+    limit: int = 10,                     # 10 ou 30 (cap em 50 pra não estourar)
+):
+    """Busca agregada por rota usando filtros do funil de quiz."""
+    try:
+        scope_list = [s.strip() for s in scopes.split(",")] if scopes else None
+        orig_list = [origin.upper()] if origin else None
+
+        # Resolve destino: IATA OU região
+        dest_list: Optional[list[str]] = None
+        if dest:
+            dest_list = [dest.upper()]
+        elif dest_region:
+            iatas = region_to_iatas(dest_region)
+            if not iatas:
+                raise HTTPException(400, f"Região desconhecida: {dest_region}. "
+                                          f"Disponíveis: {sorted(REGIONS.keys())}")
+            dest_list = iatas
+
+        # Default: ano atual
+        from datetime import datetime as _dt
+        if year is None and month is not None:
+            year = _dt.now().year
+
+        items = quiz_search(
+            scopes=scope_list,
+            origins=orig_list,
+            dests=dest_list,
+            month=month,
+            year=year,
+            limit=min(limit, 50),
+        )
+        return {"items": items, "count": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/quiz/regions")
+async def api_quiz_regions():
+    """Lista de regiões disponíveis pra usar no quiz (com cidades)."""
+    from regions import IATA_NAMES
+    out = {}
+    for region_name, iatas in REGIONS.items():
+        out[region_name] = {
+            "name": region_name,
+            "iatas": iatas,
+            "cities": [IATA_NAMES.get(i, i) for i in iatas],
+        }
+    return {"regions": out}
 
 
 if __name__ == "__main__":

@@ -385,6 +385,101 @@ def find_trip_combinations(
     return combos[:limit]
 
 
+def quiz_search(
+    scopes: Optional[list[str]] = None,        # subset de scopes (default: todos)
+    origins: Optional[list[str]] = None,       # ['GIG'] ou None pra qualquer
+    dests: Optional[list[str]] = None,         # ['FOR','REC',...] ou None
+    month: Optional[int] = None,               # 1-12 ou None
+    year: Optional[int] = None,                # default 2026
+    limit: int = 10,
+) -> list[dict]:
+    """Busca AGREGADA POR ROTA pra usar no funil de quiz.
+
+    Pra cada rota que matcha (origem/destino/scope), computa min_price,
+    n_dates, cheapest_date considerando datas de ida no mês/ano filtrado.
+    Retorna ordenado por min_price ASC. Limit pra paginar (10/30 etc).
+    """
+    from datetime import date as _d, timedelta as _td
+    reload_if_stale()
+
+    orig_set = _iata_set(origins)
+    dest_set = _iata_set(dests)
+    scope_set = set(scopes) if scopes else set(_bases().keys())
+
+    # Computa range de datas pelo mês/ano (ou ano todo se sem mês)
+    date_start: Optional[str] = None
+    date_end: Optional[str] = None
+    if year:
+        if month:
+            ds = _d(year, month, 1)
+            de = _d(year + (1 if month == 12 else 0),
+                    1 if month == 12 else month + 1, 1) - _td(days=1)
+            date_start, date_end = ds.isoformat(), de.isoformat()
+        else:
+            date_start, date_end = f"{year}-01-01", f"{year}-12-31"
+
+    by_route: dict[tuple, dict] = {}  # (scope, origin, dest, airline) -> agg
+
+    for scope in scope_set:
+        entry = _CACHE.get(scope)
+        if not entry:
+            continue
+        for rid, r in entry["routes"].items():
+            origin = (r.get("origin") or "").upper()
+            dest = (r.get("dest") or "").upper()
+            if orig_set and origin not in orig_set:
+                continue
+            if dest_set and dest not in dest_set:
+                continue
+            res = entry["results"].get(rid)
+            if not res:
+                continue
+
+            # Junta preços (out + inb + by_duration agregado em out)
+            out = res.get("outbound") or {}
+            inb = res.get("inbound") or {}
+            all_prices: list[tuple[str, int]] = []
+            for d, p in out.items():
+                if (not date_start or d >= date_start) and (not date_end or d <= date_end):
+                    all_prices.append((d, p))
+            for d, p in inb.items():
+                if (not date_start or d >= date_start) and (not date_end or d <= date_end):
+                    all_prices.append((d, p))
+            if not all_prices:
+                continue
+
+            min_p_tuple = min(all_prices, key=lambda x: x[1])
+            min_price = min_p_tuple[1]
+            cheapest_date = min_p_tuple[0]
+            n_dates = len(all_prices)
+
+            key = (scope, origin, dest, r.get("airline"))
+            existing = by_route.get(key)
+            if existing is None or min_price < existing["min_price"]:
+                by_route[key] = {
+                    "scope": scope,
+                    "route_id": rid,
+                    "origin": origin,
+                    "dest": dest,
+                    "airline": r.get("airline"),
+                    "cabin": r.get("cabin"),
+                    "direction": r.get("direction"),
+                    "min_price": min_price,
+                    "cheapest_date": cheapest_date,
+                    "n_dates": n_dates,
+                    "last_searched_at": r.get("last_searched_at"),
+                }
+
+    # Enriquece com nome de cidade pra UI
+    from regions import IATA_NAMES
+    items = list(by_route.values())
+    for it in items:
+        it["origin_city"] = IATA_NAMES.get(it["origin"], it["origin"])
+        it["dest_city"] = IATA_NAMES.get(it["dest"], it["dest"])
+    items.sort(key=lambda x: x["min_price"])
+    return items[:limit]
+
+
 def get_route_history(origin: str, dest: str, scope: Optional[str] = None) -> list[dict]:
     """Retorna rotas cadastradas que batem com origin→dest (ou dest→origin)."""
     reload_if_stale()

@@ -37,7 +37,8 @@ REGIONS = {
     "colombia": ["BOG"],
     "mexico": ["MEX", "CUN"],
     "asia": ["NRT", "HND", "ICN", "PEK", "PVG", "HKG", "SIN", "BKK", "KUL", "DOH", "DXB"],
-    "oriente_medio": ["DXB", "DOH", "IST"],
+    "sudeste_asiatico": ["SIN", "BKK", "KUL", "HAN", "SGN", "MNL", "CGK", "DPS", "HKT"],
+    "oriente_medio": ["DXB", "DOH", "IST", "AUH"],
 }
 
 
