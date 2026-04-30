@@ -464,11 +464,14 @@ def quiz_search(
             # - one-way: usa só o trecho disponível
             min_price = None
             cheapest_date = None
+            cheapest_return_date = None
             n_dates = 0
             pricing_type = None
+            top_combos: list[dict] = []
 
             if by_dur:
-                # Internacional bundled — outbound já é total
+                # Internacional bundled — outbound já é total ida+volta. Cada (dur, date)
+                # é um par real: data de volta = data + dur dias.
                 if not out_in:
                     continue
                 cheapest_out = min(out_in, key=lambda x: x[1])
@@ -476,19 +479,100 @@ def quiz_search(
                 cheapest_date = cheapest_out[0]
                 n_dates = len(out_in)
                 pricing_type = "round_trip_bundled"
+
+                # Monta lista de combos reais (out_iso, ret_iso, total) com filtro de range
+                # nas duas pontas. Pega top 3 mais baratos com (out, ret) únicos.
+                combo_list: list[dict] = []
+                for k, prices in by_dur.items():
+                    try:
+                        dur = int(k)
+                    except (ValueError, TypeError):
+                        continue
+                    if not prices:
+                        continue
+                    for out_iso, total in prices.items():
+                        if not _in_any_range(out_iso):
+                            continue
+                        try:
+                            ret_iso = (_d.fromisoformat(out_iso) + _td(days=dur)).isoformat()
+                        except Exception:
+                            continue
+                        # Volta também precisa estar no range selecionado
+                        if not _in_any_range(ret_iso):
+                            continue
+                        combo_list.append({
+                            "outbound_date": out_iso,
+                            "inbound_date": ret_iso,
+                            "stay_days": dur,
+                            "total_price": total,
+                        })
+                combo_list.sort(key=lambda x: x["total_price"])
+                seen: set = set()
+                for c in combo_list:
+                    key2 = (c["outbound_date"], c["inbound_date"])
+                    if key2 in seen:
+                        continue
+                    seen.add(key2)
+                    top_combos.append(c)
+                    if len(top_combos) >= 3:
+                        break
+                # Atualiza cheapest_date / cheapest_return_date com base no top combo
+                # (datas reais pareadas — out da combinação mais barata)
+                if top_combos:
+                    cheapest_date = top_combos[0]["outbound_date"]
+                    cheapest_return_date = top_combos[0]["inbound_date"]
+                    min_price = top_combos[0]["total_price"]
             elif out and inb:
-                # Nacional roundtrip — soma cheapest ida + cheapest volta
+                # Nacional roundtrip — pares (out, ret) com ret > out e duração 2-30 dias.
                 if not out_in:
                     continue  # se não tem ida no range, ignora
-                cheapest_out = min(out_in, key=lambda x: x[1])
-                if inb_in:
-                    cheapest_inb = min(inb_in, key=lambda x: x[1])
+                # Gera pares filtrando ambas as pontas pelo range selecionado
+                combo_list: list[dict] = []
+                # inb_in já está filtrado; se vazio, fallback pra inb completo (ex: filtro mês curtou volta)
+                inb_pool = inb_in if inb_in else list(inb.items())
+                for out_iso, out_price in out_in:
+                    try:
+                        out_d = _d.fromisoformat(out_iso)
+                    except Exception:
+                        continue
+                    for ret_iso, ret_price in inb_pool:
+                        try:
+                            ret_d = _d.fromisoformat(ret_iso)
+                        except Exception:
+                            continue
+                        stay = (ret_d - out_d).days
+                        if stay < 2 or stay > 30:
+                            continue
+                        combo_list.append({
+                            "outbound_date": out_iso,
+                            "outbound_price": out_price,
+                            "inbound_date": ret_iso,
+                            "inbound_price": ret_price,
+                            "stay_days": stay,
+                            "total_price": out_price + ret_price,
+                        })
+                combo_list.sort(key=lambda x: x["total_price"])
+                seen: set = set()
+                for c in combo_list:
+                    key2 = (c["outbound_date"], c["inbound_date"])
+                    if key2 in seen:
+                        continue
+                    seen.add(key2)
+                    top_combos.append(c)
+                    if len(top_combos) >= 3:
+                        break
+
+                if top_combos:
+                    min_price = top_combos[0]["total_price"]
+                    cheapest_date = top_combos[0]["outbound_date"]
+                    cheapest_return_date = top_combos[0]["inbound_date"]
                 else:
-                    # fallback: volta em qualquer data (caso filtro mês corte só ida)
-                    cheapest_inb_tuple = min(inb.items(), key=lambda x: x[1])
-                    cheapest_inb = cheapest_inb_tuple
-                min_price = cheapest_out[1] + cheapest_inb[1]
-                cheapest_date = cheapest_out[0]
+                    # Fallback: sem pares válidos (duração fora 2-30) → soma min/min como antes
+                    cheapest_out = min(out_in, key=lambda x: x[1])
+                    cheapest_inb_tuple = min(inb_pool, key=lambda x: x[1])
+                    min_price = cheapest_out[1] + cheapest_inb_tuple[1]
+                    cheapest_date = cheapest_out[0]
+                    cheapest_return_date = cheapest_inb_tuple[0]
                 n_dates = len(out_in)
                 pricing_type = "round_trip_sum"
             elif out_in:
@@ -521,8 +605,10 @@ def quiz_search(
                     "direction": r.get("direction"),
                     "min_price": min_price,
                     "cheapest_date": cheapest_date,
+                    "cheapest_return_date": cheapest_return_date,
                     "n_dates": n_dates,
                     "pricing_type": pricing_type,
+                    "top_combos": top_combos,
                     "last_searched_at": r.get("last_searched_at"),
                 }
 
